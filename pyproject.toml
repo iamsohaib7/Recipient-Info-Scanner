@@ -13,3 +13,10 @@ dependencies = [
     "pymupdf>=1.25.5",
     "pytesseract>=0.3.13",
 ]
+
+[dependency-groups]
+dev = [
+    "black>=25.1.0",
+    "isort>=6.0.1",
+    "pyinstaller>=6.13.0",
+]

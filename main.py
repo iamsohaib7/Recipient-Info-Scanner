@@ -193,6 +193,7 @@ class PDFProcessorGUI:
             title="Save CSV As",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
+            confirmoverwrite=False,
         )
         if path:
             self.save_path = path

@@ -20,7 +20,6 @@ from PIL import Image
 if sys.platform == "win32":
     try:
         from ctypes import windll
-
         windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
@@ -57,37 +56,41 @@ def parse_recipient_blocking(text):
         data["address"] = " ".join(lines[1:-3])
         data["city"] = lines[-3]
         data["area"] = lines[-2]
-        data["phone"] = lines[-1].split(" ")[1]
+        data["phone"] = lines[-1].split(" ")[1] if "phone" in lines[-1].lower() else lines[-1]
     return data
 
 
-# async pipline
+# async pipeline
 async def async_main(pdf_paths, coords, queue):
-    page_idx = 0
     dpi = 500
-    total = len(pdf_paths)
+    total_pages = sum(pymupdf.open(pdf).page_count for pdf in pdf_paths)
     records = []
 
     for idx, pdf in enumerate(pdf_paths):
+        doc = pymupdf.open(pdf)
+        page_count = doc.page_count
         ts_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         queue.put(
-            ("log", f"{ts_start} ▶ Starting OCR: {Path(pdf).name} ({idx+1}/{total})")
+            ("log", f"{ts_start} ▶ Starting OCR: {Path(pdf).name} ({idx+1}/{len(pdf_paths)}) with {page_count} pages")
         )
 
-        # Perform OCR
-        text = await asyncio.to_thread(ocr_region_blocking, pdf, page_idx, coords, dpi)
-        ts_ocr = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        queue.put(("log", f"{ts_ocr} ✔ OCR done: {Path(pdf).name}"))
+        for page_idx in range(page_count):
+            text = await asyncio.to_thread(ocr_region_blocking, pdf, page_idx, coords, dpi)
+            ts_ocr = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            queue.put(("log", f"{ts_ocr} ✔ OCR done: {Path(pdf).name} [Page {page_idx + 1}]"))
 
-        # Parse result
-        record = await asyncio.to_thread(parse_recipient_blocking, text)
-        ts_parsed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        parsed_str = "; ".join(f"{k}: {v}" for k, v in record.items())
-        queue.put(("log", f"{ts_parsed} → Parsed: {Path(pdf).name} [ {parsed_str} ]"))
+            try:
+                record = await asyncio.to_thread(parse_recipient_blocking, text)
+                ts_parsed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                parsed_str = "; ".join(f"{k}: {v}" for k, v in record.items())
+                queue.put(("log", f"{ts_parsed} → Parsed Page {page_idx + 1}: [ {parsed_str} ]"))
+                records.append(record)
+            except Exception as e:
+                queue.put(("log", f"[Error] ❌ Failed to parse Page {page_idx + 1} of {Path(pdf).name}: {e}"))
 
-        # Update progress bar
-        queue.put(("progress", 1))
-        records.append(record)
+            queue.put(("progress", 1))  
+
+        doc.close()
 
     return records
 
@@ -125,46 +128,30 @@ class PDFProcessorGUI:
         self.save_path = ""
         self.queue = queue.Queue()
         self.worker = None
+        self.total_pages = 0  
 
         # File selection
         frame = ttk.Frame(root, padding=10)
         frame.pack(fill="x")
-        ttk.Button(frame, text="Select PDF Files", command=self.select_files).pack(
-            side="left"
-        )
-        self.file_label = ttk.Label(
-            frame, text="No files selected", font=self.title_font
-        )
+        ttk.Button(frame, text="Select PDF Files", command=self.select_files).pack(side="left")
+        self.file_label = ttk.Label(frame, text="No files selected", font=self.title_font)
         self.file_label.pack(side="left", padx=10)
 
         # Output selection
         frame2 = ttk.Frame(root, padding=10)
         frame2.pack(fill="x")
-        ttk.Button(frame2, text="Choose Output CSV", command=self.choose_output).pack(
-            side="left"
-        )
-        self.out_label = ttk.Label(
-            frame2, text="No output chosen", font=self.title_font
-        )
+        ttk.Button(frame2, text="Choose Output CSV", command=self.choose_output).pack(side="left")
+        self.out_label = ttk.Label(frame2, text="No output chosen", font=self.title_font)
         self.out_label.pack(side="left", padx=10)
 
         # Progress bar and percent
-        self.progress = ttk.Progressbar(
-            root, orient="horizontal", length=800, mode="determinate"
-        )
+        self.progress = ttk.Progressbar(root, orient="horizontal", length=800, mode="determinate")
         self.progress.pack(padx=10, pady=(20, 5))
         self.percent_label = ttk.Label(root, text="0%", font=self.title_font)
         self.percent_label.pack(pady=(0, 10))
 
         # Log pane
-        self.log_text = tk.Text(
-            root,
-            height=12,
-            state="disabled",
-            font=self.log_font,
-            bg="#1e1e1e",
-            fg="#d4d4d4",
-        )
+        self.log_text = tk.Text(root, height=12, state="disabled", font=self.log_font, bg="#1e1e1e", fg="#d4d4d4")
         self.log_text.pack(fill="both", expand=True, padx=10, pady=5)
 
         # Start button and status
@@ -185,7 +172,6 @@ class PDFProcessorGUI:
         if files:
             self.pdf_paths = list(files)
             self.file_label.config(text=f"{len(files)} files selected")
-            self.progress["maximum"] = len(files)
             self.enable_start()
 
     def choose_output(self):
@@ -207,13 +193,15 @@ class PDFProcessorGUI:
     def start_processing(self):
         self.start_btn.config(state="disabled")
         self.status_label.config(text="Processing OCR...", foreground="blue")
-        # reset UI
         self.progress["value"] = 0
-        self.percent_label.config(text="0%")
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.config(state="disabled")
-        # background thread
+
+        self.total_pages = sum(pymupdf.open(pdf).page_count for pdf in self.pdf_paths)
+        self.progress["maximum"] = self.total_pages
+        self.percent_label.config(text="0%")
+
         self.worker = threading.Thread(target=self.run_pipeline, daemon=True)
         self.worker.start()
         self.root.after(100, self.check_queue)
@@ -222,9 +210,7 @@ class PDFProcessorGUI:
         records = asyncio.run(async_main(self.pdf_paths, HARDCODED_COORDS, self.queue))
         asyncio.run(export_to_csv_async(records, self.save_path))
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.queue.put(
-            ("log", f"{ts} - All tasks complete. CSV saved to {self.save_path}")
-        )
+        self.queue.put(("log", f"{ts} - All tasks complete. CSV saved to {self.save_path}"))
         self.queue.put(("done", None))
 
     def check_queue(self):
@@ -232,7 +218,7 @@ class PDFProcessorGUI:
             while True:
                 typ, val = self.queue.get_nowait()
                 if typ == "progress":
-                    self.progress["value"] += val
+                    self.progress["value"] += 1  # 🛠️ UPDATED: 1 page processed
                     pct = int((self.progress["value"] / self.progress["maximum"]) * 100)
                     self.percent_label.config(text=f"{pct}%")
                 elif typ == "log":
@@ -241,9 +227,7 @@ class PDFProcessorGUI:
                     self.log_text.see(tk.END)
                     self.log_text.config(state="disabled")
                 elif typ == "done":
-                    self.status_label.config(
-                        text="Finished Processing", foreground="green"
-                    )
+                    self.status_label.config(text="Finished Processing", foreground="green")
                     messagebox.showinfo("Done", "All PDFs processed and CSV saved.")
         except queue.Empty:
             pass

@@ -11,3 +11,6 @@ wheels/
 
 # ignoring lock file
 uv.lock
+# ignore pdfs and output for testing
+pdfs/
+output/
